@@ -153,6 +153,24 @@ public class XPCClient {
     private let inProgressSequentialReplies = InProgressSequentialReplies()
     private let serverRequirement: XPCClient.ServerRequirement
     private var connection: xpc_connection_t? = nil
+    private let connectionLock = NSLock()
+    private var invalidated = false
+    // Includes identity handshakes and connections established concurrently.
+    private var ownedConnections = [ObjectIdentifier: xpc_connection_t]()
+
+    /// Permanently closes this client. Future sends fail with connectionInvalid.
+    /// Pending sequences receive one terminal failure; callbacks already queued
+    /// ahead of that failure may complete. Safe to call repeatedly.
+    public func invalidate() {
+        connectionLock.lock()
+        invalidated = true
+        let connections = Array(ownedConnections.values)
+        ownedConnections.removeAll()
+        connection = nil
+        connectionLock.unlock()
+        inProgressSequentialReplies.invalidate()
+        connections.forEach { xpc_connection_cancel($0) }
+    }
     
     internal init(serverRequirement: XPCClient.ServerRequirement) {
         self.serverRequirement = serverRequirement
@@ -446,7 +464,7 @@ public class XPCClient {
                         } else {
                             result = .failure(XPCError.fromXPCObject(reply))
                         }
-                        self.handleError(event: reply)
+                        self.handleError(event: reply, connectionID: ObjectIdentifier(connection))
                         handler(result)
                     }
                 case .failure(let error):
@@ -491,8 +509,12 @@ public class XPCClient {
         self.withConnection { connectionResult in
             switch connectionResult {
                 case .success(let connection):
-                    let internalHandler = InternalXPCSequentialResponseHandlerImpl(request: request, handler: handler)
-                    self.inProgressSequentialReplies.registerHandler(internalHandler, forRequest: request)
+                    let replies = self.inProgressSequentialReplies
+                    let requestID = request.requestID
+                    let internalHandler = InternalXPCSequentialResponseHandlerImpl(request: request, handler: handler) { [weak replies] in
+                        replies?.removeHandler(requestID: requestID)
+                    }
+                    self.inProgressSequentialReplies.registerHandler(internalHandler, forRequest: request, connectionID: ObjectIdentifier(connection))
                     
                     // Sending with reply means the server ought to be kept alive until the reply is sent back
                     // From https://developer.apple.com/documentation/xpc/1505586-xpc_transaction_begin:
@@ -513,7 +535,7 @@ public class XPCClient {
                         // But if this is an internal XPC error (for example because the server shut down), we can use
                         // this to update the connection's state.
                         if xpc_get_type(reply) == XPC_TYPE_ERROR {
-                            self.handleError(event: reply)
+                            self.handleError(event: reply, connectionID: ObjectIdentifier(connection))
                         }
                     }
                 case .failure(let error):
@@ -548,75 +570,85 @@ public class XPCClient {
     // Provides a connection, doing so asynchronously when a new connection needs to be created. A connection is only
     // provided if it meets this client's server requirement.
     private func withConnection(_ handler: @escaping (Result<xpc_connection_t, XPCError>) -> Void) {
-        // The connection is set to nil when certain error conditions are encountered, see `handleError(...)`
-        if let connection = self.connection {
+        connectionLock.lock()
+        if invalidated {
+            connectionLock.unlock()
+            handler(.failure(.connectionInvalid))
+            return
+        }
+        if let connection {
+            connectionLock.unlock()
             handler(.success(connection))
             return
         }
-        
-        // The connection needs to be started (resumed) so that we can retrieve the server's identity
-        let connection = self.createConnection()
-        xpc_connection_set_event_handler(connection, self.handleEvent(event:))
+        let connection = createConnection()
+        let connectionID = ObjectIdentifier(connection)
+        ownedConnections[connectionID] = connection
+        // Keep existing callback-only lifetime semantics. Explicit invalidate
+        // breaks ownership when the owning transport is discarded.
+        xpc_connection_set_event_handler(connection) { event in
+            self.handleEvent(event: event, connectionID: connectionID)
+        }
         xpc_connection_resume(connection)
-        
-        self.serverIdentity(connection: connection) { response in
+        connectionLock.unlock()
+
+        serverIdentity(connection: connection) { response in
             switch response {
-                case .success(let serverIdentity):
-                    guard self.serverRequirement.trustServer(serverIdentity) else {
-                        handler(.failure(.insecure))
-                        return
-                    }
+            case .success(let identity):
+                let trusted = self.serverRequirement.trustServer(identity)
+                self.connectionLock.lock()
+                let isInvalidated = self.invalidated
+                let stillOwned = self.ownedConnections[connectionID] != nil
+                if !isInvalidated && stillOwned && trusted {
                     self.connection = connection
-                    handler(.success(connection))
-                case .failure(let error):
+                } else {
+                    self.ownedConnections.removeValue(forKey: connectionID)
+                }
+                self.connectionLock.unlock()
+                if isInvalidated || !stillOwned {
                     xpc_connection_cancel(connection)
-                    handler(.failure(error))
+                    handler(.failure(.connectionInvalid))
+                } else if !trusted {
+                    xpc_connection_cancel(connection)
+                    handler(.failure(.insecure))
+                } else {
+                    handler(.success(connection))
+                }
+            case .failure(let error):
+                self.connectionLock.lock()
+                self.ownedConnections.removeValue(forKey: connectionID)
+                let isInvalidated = self.invalidated
+                self.connectionLock.unlock()
+                xpc_connection_cancel(connection)
+                handler(.failure(isInvalidated ? .connectionInvalid : error))
             }
         }
     }
-    
-    // MARK: Incoming event handling
-    
-    private func handleEvent(event: xpc_object_t) {
+
+    private func handleEvent(event: xpc_object_t, connectionID: ObjectIdentifier) {
         if xpc_get_type(event) == XPC_TYPE_DICTIONARY {
-            self.inProgressSequentialReplies.handleMessage(event)
+            inProgressSequentialReplies.handleMessage(event)
         } else if xpc_get_type(event) == XPC_TYPE_ERROR {
-            self.handleError(event: event)
+            handleError(event: event, connectionID: connectionID)
         }
     }
 
-    private func handleError(event: xpc_object_t) {
-        if xpc_equal(event, XPC_ERROR_CONNECTION_INVALID) {
-            // Paraphrasing from Apple documentation:
-            //   If the named service provided could not be found in the XPC service namespace. The connection is
-            //   useless and should be disposed of.
-            //
-            // While the underlying connection is useless, this client instance is *not* useless. A scenario we want to
-            // support is:
-            //  - API user creates a client
-            //  - Attempts to send a message to a blessed helper tool
-            //  - `XPCError.connectionInvalid` is thrown
-            //  - Error is handled by installing the helper tool
-            //  - Using the same client instance successfully sends a message to the now installed helper tool
-            self.connection = nil
-        } else if xpc_equal(event, XPC_ERROR_CONNECTION_INTERRUPTED) {
-            // Apple documentation:
-            //   Will be delivered to the connection’s event handler if the remote service exited. The connection is
-            //   still live even in this case, and resending a message will cause the service to be launched on-demand.
-            //
-            // From observed behavior Apple's documentation is *not* correct. After the connection is interrupted the
-            // subsequent call will result in XPC_ERROR_CONNECTION_INVALID and the service will not be relaunched. See
-            // https://github.com/trilemma-dev/SecureXPC/issues/70 for more details and discussion.
-            //
-            // Additionally, in the case of an anonymous connection there is no service. Because there is no service,
-            // there is nothing to be relaunched on-demand. The connection might technically still be alive, but
-            // resending a message will *not* work.
+    // A connection error does not permanently invalidate this client. The next
+    // send can create a new connection (for example after service restart).
+    // Error events from an older connection must not clear a newer connection.
+    private func handleError(event: xpc_object_t, connectionID: ObjectIdentifier) {
+        guard xpc_equal(event, XPC_ERROR_CONNECTION_INVALID)
+            || xpc_equal(event, XPC_ERROR_CONNECTION_INTERRUPTED) else { return }
+        connectionLock.lock()
+        let discarded = ownedConnections.removeValue(forKey: connectionID)
+        if let connection, ObjectIdentifier(connection) == connectionID {
             self.connection = nil
         }
-        
-        // XPC_ERROR_TERMINATION_IMMINENT is not applicable to the client side of a connection
+        connectionLock.unlock()
+        inProgressSequentialReplies.fail(connectionID: connectionID, error: XPCError.fromXPCObject(event))
+        if let discarded { xpc_connection_cancel(discarded) }
     }
-    
+
     // MARK: Server identity
     
     /// A representation of the server's running program.
@@ -803,26 +835,37 @@ extension XPCClient {
 fileprivate protocol InternalXPCSequentialResponseHandler {
     var route: XPCRoute { get }
     func handleResponse(_ response: Response)
+    func fail(_ error: XPCError)
 }
 
 fileprivate class InternalXPCSequentialResponseHandlerImpl<S: Decodable>: InternalXPCSequentialResponseHandler {
     let route: XPCRoute
-    private var failedToDecode = false
+    private var terminal = false
     private let handler: XPCClient.XPCSequentialResponseHandler<S>
+    private let onDecodeFailure: () -> Void
     
     /// All responses for a given request need to be run serially in the order they were received and we don't want deserialization or the user's handler closure to
     /// block anything else from happening.
     private let serialQueue: DispatchQueue
     
-    fileprivate init(request: Request, handler: @escaping XPCClient.XPCSequentialResponseHandler<S>) {
+    fileprivate init(request: Request, handler: @escaping XPCClient.XPCSequentialResponseHandler<S>, onDecodeFailure: @escaping () -> Void) {
+        self.onDecodeFailure = onDecodeFailure
         self.route = request.route
         self.handler = handler
         self.serialQueue = DispatchQueue(label: "response-handler-\(request.requestID)")
     }
     
+    fileprivate func fail(_ error: XPCError) {
+        serialQueue.async {
+            guard !self.terminal else { return }
+            self.terminal = true
+            self.handler(.failure(error))
+        }
+    }
+
     fileprivate func handleResponse(_ response: Response) {
         self.serialQueue.async {
-            if self.failedToDecode {
+            if self.terminal {
                 return
             }
             
@@ -830,8 +873,11 @@ fileprivate class InternalXPCSequentialResponseHandlerImpl<S: Decodable>: Intern
                 if response.containsPayload {
                     self.handler(.success(try response.decodePayload(asType: S.self)))
                 } else if response.containsError {
-                    self.handler(.failure(try response.decodeError()))
+                    let error = try response.decodeError()
+                    self.terminal = true
+                    self.handler(.failure(error))
                 } else {
+                    self.terminal = true
                     self.handler(.finished)
                 }
             } catch {
@@ -846,8 +892,9 @@ fileprivate class InternalXPCSequentialResponseHandlerImpl<S: Decodable>: Intern
                 //
                 // While in theory we don't have to enforce this for the closure-based implementation, in principle and
                 // practice we want the closure and async implementations to be as consistent as possible.
+                self.terminal = true
+                self.onDecodeFailure()
                 self.handler(.failure(XPCError.asXPCError(error: error)))
-                self.failedToDecode = true
             }
         }
     }
@@ -858,12 +905,44 @@ fileprivate class InternalXPCSequentialResponseHandlerImpl<S: Decodable>: Intern
 fileprivate class InProgressSequentialReplies {
     /// Mapping of requestIDs to handlers.
     private var handlers = [UUID : InternalXPCSequentialResponseHandler]()
+    private var connections = [UUID: ObjectIdentifier]()
+    private var invalidated = false
+
+    func invalidate() {
+        serialQueue.async {
+            self.invalidated = true
+            let handlers = Array(self.handlers.values)
+            self.handlers.removeAll()
+            self.connections.removeAll()
+            handlers.forEach { $0.fail(.connectionInvalid) }
+        }
+    }
+
+    func removeHandler(requestID: UUID) {
+        serialQueue.async {
+            self.handlers.removeValue(forKey: requestID)
+            self.connections.removeValue(forKey: requestID)
+        }
+    }
+
+    func fail(connectionID: ObjectIdentifier, error: XPCError) {
+        serialQueue.async {
+            let keys = self.connections.filter { $0.value == connectionID }.map { $0.key }
+            for key in keys {
+                let handler = self.handlers.removeValue(forKey: key)
+                self.connections.removeValue(forKey: key)
+                handler?.fail(error)
+            }
+        }
+    }
     /// This queue is used to serialize access to the above dictionary.
     private let serialQueue = DispatchQueue(label: String(describing: InProgressSequentialReplies.self))
     
-    func registerHandler(_ handler: InternalXPCSequentialResponseHandler, forRequest request: Request) {
+    func registerHandler(_ handler: InternalXPCSequentialResponseHandler, forRequest request: Request, connectionID: ObjectIdentifier) {
         serialQueue.async {
+            guard !self.invalidated else { handler.fail(.connectionInvalid); return }
             self.handlers[request.requestID] = handler
+            self.connections[request.requestID] = connectionID
         }
     }
     
@@ -892,10 +971,8 @@ fileprivate class InProgressSequentialReplies {
             } else { // Finished
                 handler = self.handlers.removeValue(forKey: response.requestID)
             }
-            guard let handler = handler else {
-                fatalError("Sequential result was received for an unregistered requestID: \(response.requestID)")
-            }
-            
+            guard let handler = handler else { return }
+            if !response.containsPayload { self.connections.removeValue(forKey: response.requestID) }
             handler.handleResponse(response)
         }
     }
