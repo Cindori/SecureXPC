@@ -23,6 +23,7 @@ let package = Package(
             dependencies: []),
         .testTarget(
             name: "SecureXPCTests",
-            dependencies: ["SecureXPC"]),
+            dependencies: ["SecureXPC"],
+            exclude: ["Multiprocess Client & Server/LaunchAgent/main.swift"]),
     ]
 )
