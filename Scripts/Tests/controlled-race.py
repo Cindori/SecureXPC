@@ -26,7 +26,9 @@ DispatchQueue.global().async{
 let done=group.wait(timeout:.now()+15) == .success
 usleep(500000)
 let result:[String:Any]=["completed":done,"validated_handshakes_invalidated":hooks,"terminal_errors":errors,"server_calls":calls,"retained_clients":clients.filter{$0.value != nil}.count]
-print(String(data:try! JSONSerialization.data(withJSONObject:result,options:[.sortedKeys]),encoding:.utf8)!);exit(0)
+print(String(data:try! JSONSerialization.data(withJSONObject:result,options:[.sortedKeys]),encoding:.utf8)!);fflush(stdout)
+precondition(done && hooks == 1000 && errors == 1000 && calls == 0 && clients.allSatisfy { $0.value == nil })
+exit(0)
 }
 dispatchMain()
 '''
